@@ -10,13 +10,21 @@ from device.unload import (
 )
 from shift.lines import require_identifier
 
+ORDERED = 'ordered'
+BY_SLOT = 'by_slot'
+
 RECORDING_SCHEMA = '''
 CREATE TABLE IF NOT EXISTS recordings (
     recording_id TEXT PRIMARY KEY,
     fingerprint TEXT NOT NULL,
+    mode TEXT NOT NULL,
     position INTEGER NOT NULL CHECK (position >= 0)
 );
 '''
+
+
+class LoadReplyLost(DeviceUnavailable):
+    pass
 
 
 @dataclass(frozen=True)
@@ -57,10 +65,17 @@ def _prepare_recording(recording_id, events) -> _RecordingPlan:
 
 
 class RecordingDevice:
-    def __init__(self, path, recording_id: str, events, *, lost_unload_replies=(), query_available=True):
+    def __init__(self, path, recording_id: str, events, *, lost_unload_replies=(), query_available=True,
+                 mode: str = ORDERED, lost_load_replies=()):
         self.recording_id = require_identifier(recording_id, 'recording identifier')
+        if mode not in (ORDERED, BY_SLOT):
+            raise ValueError('invalid recording mode')
+        self._mode = mode
         self._plan = _prepare_recording(recording_id, events)
+        if self._mode == BY_SLOT and any(isinstance(event, SealRecord) for event in self._plan.events):
+            raise ValueError('a by-slot recording only carries buffer attempts')
         self._lost_replies = frozenset(lost_unload_replies)
+        self._lost_load_replies = frozenset(lost_load_replies)
         self.query_available = query_available
         self._db = sqlite3.connect(path, isolation_level=None)
         self._db.row_factory = sqlite3.Row
@@ -70,17 +85,24 @@ class RecordingDevice:
             with self._db:
                 self._db.execute('BEGIN IMMEDIATE')
                 self._db.execute(
-                    'INSERT INTO recordings VALUES (?, ?, 0) ON CONFLICT(recording_id) DO NOTHING',
-                    (self.recording_id, self._plan.fingerprint),
+                    '''INSERT INTO recordings (recording_id, fingerprint, mode, position)
+                       VALUES (?, ?, ?, 0) ON CONFLICT(recording_id) DO NOTHING''',
+                    (self.recording_id, self._plan.fingerprint, self._mode),
                 )
                 stored = self._db.execute(
-                    'SELECT fingerprint FROM recordings WHERE recording_id = ?', (self.recording_id,)
+                    'SELECT fingerprint, mode FROM recordings WHERE recording_id = ?', (self.recording_id,)
                 ).fetchone()
                 if stored['fingerprint'] != self._plan.fingerprint:
                     raise ValueError('recording already exists with different events')
+                if stored['mode'] != self._mode:
+                    raise ValueError('recording already exists with a different mode')
         except BaseException:
             self.close()
             raise
+
+    @property
+    def mode(self) -> str:
+        return self._mode
 
     def _connection(self) -> sqlite3.Connection:
         if self._db is None:
@@ -99,6 +121,8 @@ class RecordingDevice:
         return len(self._plan.events)
 
     def next_event(self) -> BufferAttempt | SealRecord | None:
+        if self._mode != ORDERED:
+            raise DeviceUnavailable('a by-slot recording only loads through slot pulls')
         db = self._connection()
         with db:
             db.execute('BEGIN IMMEDIATE')
@@ -115,6 +139,33 @@ class RecordingDevice:
                 'UPDATE recordings SET position = ? WHERE recording_id = ?', (position + 1, self.recording_id)
             )
             return event
+
+    def load_slot(self, slot: int) -> BufferAttempt | None:
+        if self._mode != BY_SLOT:
+            raise DeviceUnavailable('an ordered recording does not load by slot')
+        if type(slot) is not int or slot not in (0, 1):
+            raise ValueError('invalid device slot')
+        db = self._connection()
+        fresh = None
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            for event in self._plan.events:
+                if event.key.slot != slot:
+                    continue
+                outcome = query_unload(db, event.key)
+                if outcome.status == 'exited':
+                    continue
+                if outcome.status == 'resident':
+                    return event
+                if not occupy_slot(db, event):
+                    raise RuntimeError('device slot holds an attempt outside the pull plan')
+                fresh = event
+                break
+            else:
+                return None
+        if fresh.event_id in self._lost_load_replies:
+            raise LoadReplyLost('device committed the load before its reply was lost')
+        return fresh
 
     def read_attempt(self, key: AttemptKey) -> BufferAttempt | None:
         db = self._connection()

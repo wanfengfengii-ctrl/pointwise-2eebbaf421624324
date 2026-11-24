@@ -8,10 +8,14 @@ from archive.publication import PublicationBlocked, publication_number, publish
 from device.recording import RecordingDevice
 from handover.accept import accept
 from handover.issue import finish_shift_handover, issue
-from intake.capture import capture
+from intake.capture import capture, pull
 from recording_sample import RECORDING, ROSTER, SHIFT, ordinary, rollover_events
 from review.lookup import read
 from shift.open_shift import connect_station, open_shift
+from slot_pull_sample import RECORDING as SLOT_RECORDING
+from slot_pull_sample import ROSTER as SLOT_ROSTER
+from slot_pull_sample import SHIFT as SLOT_SHIFT
+from slot_pull_sample import slot_events
 
 
 class RollRowMismatch(RuntimeError):
@@ -71,6 +75,62 @@ def run_rollover(db, device):
     )
 
 
+def run_slot_pull(db, directory: Path):
+    open_shift(db, SLOT_SHIFT, SLOT_ROSTER)
+    plan = slot_events()
+    p0, _, q = plan
+    device = RecordingDevice(
+        directory / 'slot-device.sqlite', SLOT_RECORDING, plan, mode='by_slot', lost_load_replies={'P0'}
+    )
+    try:
+        first = pull(db, device, SLOT_SHIFT, 0, 'pull-p0')
+        if first.status != 'pending':
+            raise RuntimeError(f'P0 装片失答应在办，实际 {first.status}')
+        q_pull = pull(db, device, SLOT_SHIFT, 1, 'pull-q')
+        if (q_pull.status, q_pull.event_id) != ('received', 'Q'):
+            raise RuntimeError('P0 在办时 Q 未能实收')
+        signed_q = publish(db, SLOT_SHIFT, 'Q')
+        q_readings = list(read(db, signed_q.receipt.number).readings)
+        device.close()
+        device = RecordingDevice(directory / 'slot-device.sqlite', SLOT_RECORDING, plan, mode='by_slot')
+        settled = pull(db, device, SLOT_SHIFT, 0, 'pull-p0')
+        reused = pull(db, device, SLOT_SHIFT, 0, 'pull-p1')
+        if (settled.status, settled.event_id, settled.key) != ('received', 'P0', p0.key):
+            raise RuntimeError('重开后原拉取号未能认回实际已装的 P0')
+        if (reused.status, reused.event_id) != ('received', 'P1'):
+            raise RuntimeError('槽位复用后未能续拉 P1')
+        signed = {line: publish(db, SLOT_SHIFT, line) for line in SLOT_ROSTER}
+    finally:
+        device.close()
+    offline = pull(db, None, SLOT_SHIFT, 0, 'pull-p0')
+    offline_q = pull(db, None, SLOT_SHIFT, 1, 'pull-q')
+    expected = {
+        'first_p0': 'pending', 'q_first_readings': [13],
+        'settled_p0': ['received', 'P0'], 'reused_slot': ['received', 'P1'],
+        'offline_p0': ['received', 'P0', 'roll-1', 0, 1],
+    }
+    actual = {
+        'first_p0': first.status, 'q_first_readings': q_readings,
+        'settled_p0': [settled.status, settled.event_id],
+        'reused_slot': [reused.status, reused.event_id],
+        'offline_p0': [offline.status, offline.event_id, offline.key.roll, offline.key.slot, offline.key.load],
+    }
+    observed = {line: list(read(db, signed[line].receipt.number).readings) for line in SLOT_ROSTER}
+    if (actual != expected or observed != {'P0': [7], 'P1': [11], 'Q': [13]}
+            or offline.receipt != settled.receipt or offline_q.receipt != q_pull.receipt):
+        raise RuntimeError(f'按槽续拉结果 {actual} / {observed}，期望 {expected}')
+    emit(
+        'slot-pull',
+        {'plan': [json.loads(item.raw) for item in plan], 'lost_load_replies': ['P0']},
+        expected, actual, {'P0': [7], 'P1': [11], 'Q': [13]}, observed,
+        ['device/recording.py', 'intake/pulls.py', 'intake/capture.py', 'archive/publication.py'],
+        'P0 装片失答仍在办时 Q 先实收并签出 13；重开后原号认回 P0，槽位复用装 P1，关源后按号复领原任次。',
+    )
+    print(f'按槽续拉：Q 先签 {signed_q.receipt.number} 读值 {q_readings}，'
+          f'P0 续拉 {settled.status}，关源后 pull-p0 复领 {offline.event_id} '
+          f'原任次 ({offline.key.roll}, 槽 {offline.key.slot}, 装载 {offline.key.load})')
+
+
 def run(directory: Path, rollover_only: bool):
     events = rollover_events()
     station_path = directory / 'station.sqlite'
@@ -86,6 +146,7 @@ def run(directory: Path, rollover_only: bool):
             run_rollover(db, device)
             if rollover_only:
                 return
+            run_slot_pull(db, directory)
             handover = issue(db, SHIFT, 'night-review', ('east', 'bend'))
             finish_shift_handover(db, SHIFT, handover.number)
     finally:
